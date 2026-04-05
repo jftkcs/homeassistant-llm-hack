@@ -77,29 +77,36 @@ type OpenAIConfigEntry = ConfigEntry[openai.AsyncClient]
 
 from homeassistant.helpers import llm as patched_llm
 
-# Blank out the BASE_PROMPT to fix caching issues (https://github.com/home-assistant/core/issues?q=llm%20cache)
-# Issues #133687 and #134847, PR #141156
-patched_llm.BASE_PROMPT = ('')
-
-
-# Bastardized copy of _get_exposed_entities from llm.py as of https://github.com/home-assistant/core/blob/2025.3.4/homeassistant/helpers/llm.py
+# Bastardized copy of _get_exposed_entities from llm.py as of https://github.com/home-assistant/core/blob/2026.4.1/homeassistant/helpers/llm.py
 # Fixes issues related to 0-255 brightness representation
 # Issues #134848, #134592
 def _custom_get_exposed_entities(
-    hass: HomeAssistant, assistant: str
+    hass: HomeAssistant,
+    assistant: str,
+    include_state: bool = True,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """Get exposed entities.
 
     Splits out calendars and scripts.
     """
 
+    from operator import attrgetter
+
     from enum import Enum
     from decimal import Decimal
-    from homeassistant.helpers import device_registry as dr
-    from homeassistant.helpers import area_registry as ar
-    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers import (
+        area_registry as ar,
+        config_validation as cv,
+        device_registry as dr,
+        entity_registry as er,
+        floor_registry as fr,
+        intent,
+        selector,
+        service,
+    )
     from homeassistant.components.homeassistant import async_should_expose
     from homeassistant.components.script import DOMAIN as SCRIPT_DOMAIN
+    from homeassistant.components.todo import DOMAIN as TODO_DOMAIN, TodoServices
     from homeassistant.components.calendar import (
         DOMAIN as CALENDAR_DOMAIN
     )
@@ -129,58 +136,72 @@ def _custom_get_exposed_entities(
         CALENDAR_DOMAIN: {},
     }
 
-    for state in hass.states.async_all():
+    for state in sorted(hass.states.async_all(), key=attrgetter("name")):
         if not async_should_expose(hass, assistant, state.entity_id):
             continue
 
-        description: str | None = None
         entity_entry = entity_registry.async_get(state.entity_id)
-        names = [state.name]
+        device_entry = (
+            device_registry.async_get(entity_entry.device_id)
+            if entity_entry is not None and entity_entry.device_id is not None
+            else None
+        )
+        names = intent.async_get_entity_aliases(hass, entity_entry, state=state)
         area_names = []
 
         if entity_entry is not None:
-            names.extend(entity_entry.aliases)
-            if entity_entry.area_id and (
-                area := area_registry.async_get_area(entity_entry.area_id)
+            if (
+                entity_entry.area_id is not None
+                and (area_entry := area_registry.async_get_area(entity_entry.area_id))
+                is not None
             ):
                 # Entity is in area
-                area_names.append(area.name)
-                area_names.extend(area.aliases)
-            elif entity_entry.device_id and (
-                device := device_registry.async_get(entity_entry.device_id)
-            ):
+                area_names.append(area_entry.name)
+                area_names.extend(area_entry.aliases)
+            elif device_entry is not None:
                 # Check device area
-                if device.area_id and (
-                    area := area_registry.async_get_area(device.area_id)
+                if (
+                    device_entry.area_id is not None
+                    and (
+                        area_entry := area_registry.async_get_area(device_entry.area_id)
+                    )
+                    is not None
                 ):
-                    area_names.append(area.name)
-                    area_names.extend(area.aliases)
+                    area_names.append(area_entry.name)
+                    area_names.extend(area_entry.aliases)
 
         info: dict[str, Any] = {
             "names": ", ".join(names),
             "domain": state.domain,
-            "state": state.state,
         }
 
-        if description:
-            info["description"] = description
+        if include_state:
+            info["state"] = state.state
+
+            # Convert timestamp device_class states from UTC to local time
+            if state.attributes.get("device_class") == "timestamp" and state.state:
+                if (parsed_utc := dt_util.parse_datetime(state.state)) is not None:
+                    info["state"] = dt_util.as_local(parsed_utc).isoformat()
 
         if area_names:
             info["areas"] = ", ".join(area_names)
 
-        attributes = {}
-        for attr_name, attr_value in state.attributes.items():
-            if attr_name in interesting_attributes:
-                if attr_name == "brightness" and isinstance(attr_value, (int, float)):
-                    # Convert brightness 0–255 to 0–100
-                    attributes[attr_name] = round((attr_value / 255.0) * 100)
-                elif isinstance(attr_value, (Enum, Decimal, int)):
-                    attributes[attr_name] = str(attr_value)
-                else:
-                    attributes[attr_name] = attr_value
+        # NOTE - this block is the only chang e from the original function
+        if include_state:
+            attributes = {}
+            for attr_name, attr_value in state.attributes.items():
+                if attr_name in interesting_attributes:
+                    if attr_name == "brightness" and isinstance(attr_value, (int, float)):
+                        # Convert brightness 0–255 to 0–100
+                        attributes[attr_name] = round((attr_value / 255.0) * 100)
+                    elif isinstance(attr_value, (Enum, Decimal, int)):
+                        attributes[attr_name] = str(attr_value)
+                    else:
+                        attributes[attr_name] = attr_value
 
-        if attributes:
-            info["attributes"] = attributes
+            if attributes:
+                info["attributes"] = attributes
+        # End of changes
 
         if state.domain in data:
             data[state.domain][state.entity_id] = info
