@@ -519,9 +519,9 @@ class OpenAIBaseLLMEntity(Entity):
                 )
                 if not model_args["model"].startswith("gpt-5-pro")
                 else "high",  # GPT-5 pro only supports reasoning.effort: high
-                "summary": options.get(
-                    CONF_REASONING_SUMMARY, RECOMMENDED_REASONING_SUMMARY
-                ),
+                # "summary": options.get(
+                #     CONF_REASONING_SUMMARY, RECOMMENDED_REASONING_SUMMARY
+                # ),
             }
             model_args["include"] = ["reasoning.encrypted_content"]
 
